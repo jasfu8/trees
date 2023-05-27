@@ -1,0 +1,285 @@
+---
+title: "Wood Thrush Site Fidelity Data Exploration"
+author: "Jasmine Fu"
+date: "2023-05-27"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Read in migrant data + Load tidyverse
+
+source('source_script.R')
+
+# Load necessary packages for spatial data
+
+library(sf)
+library(tmap)
+
+# Read in net data
+
+nets <-
+  read_csv("trbo_nets.csv",
+           n_max = 30) %>%
+  select(net_number = `Net Number`,
+         longitude = Long,
+         latitude = Lat) %>%
+  
+  # Turn latitude and longitude into sf objects
+  
+  mutate(
+    longitude = as.numeric(longitude),
+    latitude = as.numeric(latitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326) %>%
+  select(net_number,
+         gps = geometry)
+
+```
+## Introduction
+
+In this analysis, I attempt to find evidence for site fidelity at TREES in Wood Thrushes.
+
+## Subsetting the population to recaptures
+
+I dropped observations that did not have a valid net number. Then, I subset the data to all WOTH individuals that were captured more than 4 times. I replaced the net numbers with the the GPS coordinates of each net. The column `captures` shows the number of times an individual has been captured at the TREES site.
+
+```{r recapture-pts}
+# Get the band numbers of recaptured individuals
+
+recaps <-
+  migrant %>%
+  filter(code %in% c("R", "SD")) %>%
+  distinct(band_full)
+
+# Get the GPS points of each observation
+
+recapture_pts <- 
+  migrant %>%
+  
+  # Retain individuals that were captured more than once
+  
+  semi_join(recaps,
+            by = "band_full") %>%
+  
+  # Drop observations with no valid net number
+  
+  drop_na(net_number) %>%
+  
+  # Create 'captures': no. of times an individual has been captured
+  
+  mutate(captures = n(),
+         .by = band_full) %>%
+  
+  # Keep WOTH individuals that have been captured more than 4 times
+  
+  filter(
+    species_code %in% "WOTH",
+    captures > 4) %>%
+  
+  # Get GPS coordinates from 'net' data
+  
+  inner_join(nets, by = "net_number") %>%
+  
+  # Keep the following columns
+  
+  select(band_full, captures, gps)
+
+recapture_pts
+```
+
+The data I will work with in the next steps consists of `r nrow(recapture_pts)` observations from `r recapture_pts %>% distinct(band_full) %>% nrow()` individuals (as seen above).
+
+## Calculating centroids
+
+I took the GPS points for each individual and calculated their center point (i.e. centroid). The map below visualizes the centroid of each individual in yellow.
+
+```{r centroid-map}
+centroids <-
+  recapture_pts %>%
+  summarize(centroid = st_union(gps) %>%
+              st_centroid(),
+            .by = band_full) %>%
+  left_join(recapture_pts %>%
+              distinct(band_full, captures),
+            by = "band_full")
+
+# A map of the nets and individual's centroids
+
+tmap_mode("view")
+
+# Add the tmap layer for points
+
+tm_basemap("Esri.WorldImagery") +
+  tm_shape(nets) +
+  tm_dots(size = 0.15, col = "white") +
+  tm_text("net_number", size = 0.75) +
+  tm_shape(st_as_sf(centroids)) +
+  tm_dots(col = "yellow", size = 0.1, alpha = 0.7)
+```
+
+## Calculating average distance from centroids
+
+I calculated the distance between the GPS coordinates of the observation and the centroid of the individual. Then I calculated the mean distance from centroid for each individual. The mean distances are plotted in the histogram below.
+
+```{r distances-indv}
+# Get the mean distance from centroids for each individual
+
+distances_indv <-
+  recapture_pts %>%
+  select(band_full, gps) %>%
+  
+  # Calculate centroid for each individual
+  
+  group_by(band_full) %>%
+  mutate(centroid = st_union(gps) %>%
+           st_centroid()) %>%
+  ungroup() %>%
+  
+  # Calculate distance from centroid for each individual
+  
+  rowwise() %>%
+  mutate(distance = st_distance(gps, centroid)) %>%
+  ungroup() %>%
+  
+  # Calculate the mean distance from centroid for each individual
+  
+  summarize(mean_distance = mean(distance) %>%
+              as.numeric(),
+            .by = band_full)
+  
+# Get the mean distance from centroid for all individuals
+
+actual_mean <-
+  distances_indv %>%
+  summarize(avg = mean(mean_distance)) %>%
+  pull(avg)
+
+# Plot distances
+
+ggplot(distances_indv, aes(x = mean_distance)) +
+  geom_histogram(binwidth = 10) +
+  geom_vline(xintercept = actual_mean,
+             color = "red") +
+  annotate("text",
+           x = actual_mean + 2,
+           y = 1.5,
+           label = "Mean distance for all individuals",
+           angle = 90,
+           color = "white") +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0,4)) +
+  labs(title = "Mean distance from centroids by individual",
+       x = "Mean distance from centroid (m)",
+       y = "Number of individuals")
+
+```
+
+The mean distance from the centroid for all individuals is `r actual_mean` meters, and the median is `r distances_indv %>% summarize(median = median(mean_distance)) %>% pull(median)` meters.
+
+## Permutation test
+I performed a permutation test to verify if net visits are dependent on individual. If individuals are randomly visiting nets, then permuting (mixing up) the net numbers will yield a similar mean distance to the actual mean.
+
+If individuals do not have a specific preference for a small area, then the actual mean will be significantly smaller than the mean from permuting the net numbers in the data.
+
+In the code below, I permuted the net numbers of the data, then calculated the mean distance from the centroid of each individual. I repeated this process 999 more times to generate 1000 permuted means in total. I plotted these means with the actual mean of the data in a histogram.
+
+```{r permutation-test}
+
+# Set seed for reproducibility
+set.seed(54)
+
+# Perform the permutation and calculation a thousand times
+
+permuted_means <-
+  
+  # Perform the operation below 1000 times
+  
+  replicate(1000, {
+    
+    # Filter data for recaptured individuals
+    
+    migrant %>%
+      semi_join(recaps,
+                by = "band_full") %>%
+      
+      # Drop observations that have an invalid net number
+      
+      drop_na(net_number) %>%
+      
+      # Retain WOTH individuals with more than 4 captures
+      
+      filter(species_code %in% "WOTH") %>%
+      filter(n() > 4,
+             .by = band_full) %>%
+      
+      # Permute the net numbers of their observations
+      
+      mutate(net_number = sample(net_number)) %>%
+      
+      # Get GPS points of nets
+      
+      inner_join(nets, by = "net_number") %>%
+      
+      # Calculate the centroid of individuals
+      
+      group_by(band_full) %>%
+      mutate(centroid = st_union(gps) %>%
+               st_centroid()) %>%
+      ungroup() %>%
+      
+      # Calculate the distance from centroid
+      
+      rowwise() %>%
+      mutate(distance = st_distance(gps, centroid)) %>%
+      ungroup() %>%
+      
+      # Calculate the mean distance for each individual
+      
+      summarize(mean_distance = mean(distance),
+                .by = band_full) %>%
+      
+      # Calculate the average mean distance for all individuals
+      
+      summarize(avg = mean(mean_distance)) %>%
+      pull(avg)
+  })
+
+
+# Create a histogram of the average values
+ggplot(data.frame(
+  avg = unlist(permuted_means)),
+  aes(x = avg)) +
+  geom_histogram(binwidth = 0.5) +
+  geom_vline(xintercept = actual_mean,
+             color = "red") +
+  annotate("text",
+           x = actual_mean + 1,
+           y = 50,
+           label = "Mean distance for all individuals",
+           angle = 90,
+           color = "black") +
+  scale_y_continuous(expand = c(0,0),
+                     breaks = seq(0,80,10),
+                     limits = c(0,80)) +
+  labs(title = "Permuted means vs. actual mean",
+       x = "Permuted mean distance (m)",
+       y = "Number of results")
+```
+
+As seen above, the actual mean is a lot lower than the means calculated from the permutation test.
+
+### Statistical difference of permuted and actual mean
+I performed a right-tailed student's t-test to verify that the permuted means are statistically higher than the actual mean in the data.
+```{r t-test}
+# Test statistical difference of original and permuted means
+t.test(permuted_means,
+       
+       # Perform a right-tailed t-test
+       
+       alternative = "greater",
+       mu = actual_mean)
+```
